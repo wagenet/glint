@@ -1,0 +1,361 @@
+import { statSync as fsStatSync, existsSync } from 'fs';
+import { rewriteModule, rewriteDiagnostic, createTransformDiagnostic, } from '../transform/index.js';
+import DocumentCache, { templatePathForSynthesizedModule } from './document-cache.js';
+export default class TransformManager {
+    constructor(glintConfig, documents = new DocumentCache(glintConfig)) {
+        this.glintConfig = glintConfig;
+        this.documents = documents;
+        this.transformCache = new Map();
+        this.resolveModuleNameLiterals = (moduleLiterals, containingFile, redirectedReference, options) => {
+            return moduleLiterals.map((literal) => {
+                // If import paths are allowed to include TS extensions (`.ts`, `.tsx`, etc), then we want to
+                // ensure we normalize things like `.gts` to the standard script path we present elsewhere so
+                // that TS understands the intent.
+                // @ts-ignore: this flag isn't available in the oldest versions of TS we support
+                let scriptPath = options.allowImportingTsExtensions
+                    ? this.getScriptPathForTS(literal.text)
+                    : literal.text;
+                return this.ts.resolveModuleName(scriptPath, containingFile, options, this.moduleResolutionHost, this.moduleResolutionCache, redirectedReference);
+            });
+        };
+        this.watchTransformedFile = (path, originalCallback, pollingInterval, options) => {
+            const { watchFile } = this.ts.sys;
+            if (!watchFile) {
+                throw new Error('Internal error: TS `watchFile` unavailable');
+            }
+            let { glintConfig, documents } = this;
+            let callback = (watchedPath, eventKind) => {
+                if (eventKind === this.ts.FileWatcherEventKind.Deleted) {
+                    // Adding or removing a file invalidates most of what we think we know about module resolution
+                    this.moduleResolutionCache.clear();
+                    this.documents.removeDocument(watchedPath);
+                }
+                else {
+                    this.documents.markDocumentStale(watchedPath);
+                }
+                return originalCallback(path, eventKind);
+            };
+            if (!glintConfig.includesFile(path)) {
+                return watchFile(path, callback, pollingInterval, options);
+            }
+            let allPaths = [
+                ...glintConfig.environment.getPossibleTemplatePaths(path).map((candidate) => candidate.path),
+                ...documents.getCandidateDocumentPaths(path),
+            ];
+            let allWatchers = allPaths.map((candidate) => watchFile(candidate, callback, pollingInterval, options));
+            return {
+                close() {
+                    allWatchers.forEach((watcher) => watcher.close());
+                },
+            };
+        };
+        this.watchDirectory = (path, originalCallback, recursive, options) => {
+            if (!this.ts.sys.watchDirectory) {
+                throw new Error('Internal error: TS `watchDirectory` unavailable');
+            }
+            let callback = (filename) => {
+                // Adding or removing a file invalidates most of what we think we know about module resolution
+                this.moduleResolutionCache.clear();
+                originalCallback(this.getScriptPathForTS(filename));
+            };
+            return this.ts.sys.watchDirectory(path, callback, recursive, options);
+        };
+        this.readDirectory = (rootDir, extensions, excludes, includes, depth) => {
+            let env = this.glintConfig.environment;
+            let allExtensions = [...new Set([...extensions, ...env.getConfiguredFileExtensions()])];
+            return this.ts.sys
+                .readDirectory(rootDir, allExtensions, excludes, includes, depth)
+                .map((filename) => this.getScriptPathForTS(filename));
+        };
+        this.fileExists = (filename) => {
+            // First check if the file exists normally
+            if (this.documents.documentExists(filename)) {
+                return true;
+            }
+            // Check for declaration files with alternative extensions
+            return this.findAlternativeDeclarationFile(filename) !== null;
+        };
+        this.readTransformedFile = (filename, encoding) => {
+            let transformInfo = this.getTransformInfo(filename, encoding);
+            if (transformInfo?.transformedModule) {
+                return transformInfo.transformedModule.transformedContents;
+            }
+            else {
+                // Check if this is a request for a declaration file that should be served
+                // from the original extension (e.g. serve x.gjs.d.ts when x.d.ts is requested)
+                if (filename.endsWith('.d.ts')) {
+                    const alternativeFile = this.findAlternativeDeclarationFile(filename);
+                    if (alternativeFile) {
+                        return this.ts.sys.readFile(alternativeFile, encoding);
+                    }
+                }
+                return this.documents.getDocumentContents(filename, encoding);
+            }
+        };
+        this.getModifiedTime = (filename) => {
+            // In most circumstances we can just ask the DocumentCache what the canonical path
+            // for a given document is, but since `getModifiedTime` is invoked as part of
+            // rehydrating a `.tsbuildinfo` file, typically won't actually know the answer to
+            // that question yet.
+            let canonicalFilename = this.documents
+                .getCandidateDocumentPaths(filename)
+                .find((path) => existsSync(path));
+            if (!canonicalFilename)
+                return undefined;
+            let fileStat = statSync(canonicalFilename);
+            if (!fileStat)
+                return undefined;
+            let companionPath = this.documents.getCompanionDocumentPath(canonicalFilename);
+            if (!companionPath)
+                return fileStat.mtime;
+            let companionStat = statSync(companionPath);
+            if (!companionStat)
+                return fileStat.mtime;
+            return fileStat.mtime > companionStat.mtime ? fileStat.mtime : companionStat.mtime;
+        };
+        this.ts = glintConfig.ts;
+        this.moduleResolutionCache = this.ts.createModuleResolutionCache(this.ts.sys.getCurrentDirectory(), (name) => name);
+        this.moduleResolutionHost = {
+            ...this.ts.sys,
+            readFile: this.readTransformedFile,
+            fileExists: this.fileExists,
+        };
+    }
+    getTransformDiagnostics(fileName) {
+        if (fileName) {
+            let transformedModule = this.getTransformInfo(fileName)?.transformedModule;
+            return transformedModule ? this.buildTransformDiagnostics(transformedModule) : [];
+        }
+        return [...this.transformCache.values()].flatMap((transformInfo) => {
+            if (transformInfo.transformedModule) {
+                return this.buildTransformDiagnostics(transformInfo.transformedModule);
+            }
+            return [];
+        });
+    }
+    rewriteDiagnostics(diagnostics, fileName) {
+        let unusedExpectErrors = new Set(this.getExpectErrorDirectives(fileName));
+        let allDiagnostics = [];
+        for (let diagnostic of diagnostics) {
+            let { rewrittenDiagnostic, appliedDirective } = this.rewriteDiagnostic(diagnostic);
+            if (rewrittenDiagnostic) {
+                allDiagnostics.push(rewrittenDiagnostic);
+            }
+            if (appliedDirective?.kind === 'expect-error') {
+                unusedExpectErrors.delete(appliedDirective);
+            }
+        }
+        for (let directive of unusedExpectErrors) {
+            allDiagnostics.push(createTransformDiagnostic(this.ts, directive.source, `Unused '@glint-expect-error' directive.`, directive.location));
+        }
+        // When we have syntax errors we get _too many errors_
+        // if we have an issue with <template> tranformation, we should
+        // make the user fix their syntax before revealing all the other errors.
+        let contentTagErrors = allDiagnostics.filter((diagnostic) => diagnostic.isContentTagError);
+        if (contentTagErrors.length) {
+            return this.ts.sortAndDeduplicateDiagnostics(contentTagErrors);
+        }
+        return this.ts.sortAndDeduplicateDiagnostics(allDiagnostics);
+    }
+    getTransformedRange(originalFileName, originalStart, originalEnd) {
+        let transformInfo = this.findTransformInfoForOriginalFile(originalFileName);
+        if (!transformInfo?.transformedModule) {
+            return {
+                transformedFileName: originalFileName,
+                transformedStart: originalStart,
+                transformedEnd: originalEnd,
+            };
+        }
+        let { transformedFileName, transformedModule } = transformInfo;
+        let transformedRange = transformedModule.getTransformedRange(originalFileName, originalStart, originalEnd);
+        return {
+            transformedFileName,
+            transformedStart: transformedRange.start,
+            transformedEnd: transformedRange.end,
+            mapping: transformedRange.mapping,
+        };
+    }
+    getOriginalRange(transformedFileName, transformedStart, transformedEnd) {
+        let transformInfo = this.getTransformInfo(transformedFileName);
+        let { documents } = this;
+        if (!transformInfo?.transformedModule) {
+            return {
+                originalFileName: documents.getCanonicalDocumentPath(transformedFileName),
+                originalStart: transformedStart,
+                originalEnd: transformedEnd,
+            };
+        }
+        let original = transformInfo.transformedModule.getOriginalRange(transformedStart, transformedEnd);
+        return {
+            mapping: original.mapping,
+            originalFileName: documents.getCanonicalDocumentPath(original.source.filename),
+            originalStart: original.start,
+            originalEnd: original.end,
+        };
+    }
+    getTransformedOffset(originalFileName, originalOffset) {
+        let transformInfo = this.findTransformInfoForOriginalFile(originalFileName);
+        if (!transformInfo?.transformedModule) {
+            return { transformedFileName: originalFileName, transformedOffset: originalOffset };
+        }
+        let { transformedFileName, transformedModule } = transformInfo;
+        let transformedOffset = transformedModule.getTransformedOffset(originalFileName, originalOffset);
+        return { transformedFileName, transformedOffset };
+    }
+    /**
+     * Given the path of a file on disk, returns the path under which we present TypeScript with
+     * its contents. This will include normalizations like `.gts` -> `.ts`, as well as relating
+     * a given `.hbs` file back to its backing module, if one exists.
+     */
+    getScriptPathForTS(filename) {
+        // If the file is a template and already has a companion, return that path
+        if (this.glintConfig.environment.isTemplate(filename)) {
+            let companionPath = this.documents.getCompanionDocumentPath(filename);
+            if (companionPath) {
+                return companionPath;
+            }
+        }
+        // Otherwise, follow the environment's standard rules for determining the path we present to TS
+        return this.glintConfig.getSynthesizedScriptPathForTS(filename);
+    }
+    /** @internal `TransformInfo` is an unstable internal type */
+    findTransformInfoForOriginalFile(originalFileName) {
+        let transformedFileName = this.glintConfig.environment.isTemplate(originalFileName)
+            ? this.documents.getCompanionDocumentPath(originalFileName)
+            : originalFileName;
+        return transformedFileName ? this.getTransformInfo(transformedFileName) : null;
+    }
+    getExpectErrorDirectives(filename) {
+        let transformInfos = filename
+            ? [this.getTransformInfo(filename)]
+            : [...this.transformCache.values()];
+        return transformInfos.flatMap((transformInfo) => {
+            if (!transformInfo.transformedModule)
+                return [];
+            return transformInfo.transformedModule.directives.filter((directive) => directive.kind === 'expect-error');
+        });
+    }
+    rewriteDiagnostic(diagnostic) {
+        if (!diagnostic.file)
+            return {};
+        // Transform diagnostics are already targeted at the original source and so
+        // don't need to be rewritten.
+        if ('isGlintTransformDiagnostic' in diagnostic && diagnostic.isGlintTransformDiagnostic) {
+            return { rewrittenDiagnostic: diagnostic };
+        }
+        let transformInfo = this.getTransformInfo(diagnostic.file?.fileName);
+        let rewrittenDiagnostic = rewriteDiagnostic(this.ts, diagnostic, (fileName) => this.getTransformInfo(fileName)?.transformedModule);
+        if (rewrittenDiagnostic.file) {
+            rewrittenDiagnostic.file.fileName = this.documents.getCanonicalDocumentPath(rewrittenDiagnostic.file.fileName);
+        }
+        let appliedDirective = transformInfo.transformedModule?.directives.find((directive) => directive.source.filename === rewrittenDiagnostic.file?.fileName &&
+            directive.areaOfEffect.start <= rewrittenDiagnostic.start &&
+            directive.areaOfEffect.end > rewrittenDiagnostic.start);
+        // All current directives have the effect of squashing any diagnostics they apply
+        // to, so if we have an applicable directive, we don't return the diagnostic.
+        if (appliedDirective) {
+            return { appliedDirective };
+        }
+        else {
+            return { rewrittenDiagnostic };
+        }
+    }
+    getTransformInfo(filename, encoding) {
+        let { documents, glintConfig } = this;
+        let { environment } = glintConfig;
+        let documentID = documents.getDocumentID(filename);
+        let existing = this.transformCache.get(documentID);
+        let version = documents.getCompoundDocumentVersion(filename);
+        if (existing?.version === version) {
+            return existing;
+        }
+        let transformedModule = null;
+        if (environment.isScript(filename) && glintConfig.includesFile(filename)) {
+            if (documents.documentExists(filename)) {
+                let contents = documents.getDocumentContents(filename, encoding);
+                let templatePath = documents.getCompanionDocumentPath(filename);
+                let canonicalPath = documents.getCanonicalDocumentPath(filename);
+                let mayHaveEmbeds = environment.moduleMayHaveEmbeddedTemplates(canonicalPath, contents);
+                if (mayHaveEmbeds || templatePath) {
+                    let script = { filename: canonicalPath, contents };
+                    let template = templatePath
+                        ? {
+                            filename: templatePath,
+                            contents: documents.getDocumentContents(templatePath, encoding),
+                        }
+                        : undefined;
+                    transformedModule = rewriteModule(this.ts, { script, template }, environment);
+                }
+            }
+            else {
+                let templatePath = templatePathForSynthesizedModule(filename);
+                if (documents.documentExists(templatePath) &&
+                    documents.getCompanionDocumentPath(templatePath) === filename) {
+                    // The script we were asked for doesn't exist, but a corresponding template does, and
+                    // it doesn't have a companion script elsewhere.
+                    // We default to just `export {}` to reassure TypeScript that this is definitely a module
+                    let script = { filename, contents: 'export {}' };
+                    let template = {
+                        filename: templatePath,
+                        contents: documents.getDocumentContents(templatePath, encoding),
+                    };
+                    transformedModule = rewriteModule(this.ts, { script, template }, glintConfig.environment);
+                }
+            }
+        }
+        let transformedFileName = glintConfig.getSynthesizedScriptPathForTS(filename);
+        let cacheEntry = { version, transformedFileName, transformedModule };
+        this.transformCache.set(documentID, cacheEntry);
+        return cacheEntry;
+    }
+    buildTransformDiagnostics(transformedModule) {
+        return transformedModule.errors.map((error) => createTransformDiagnostic(this.ts, error.source, error.message, error.location, error.isContentTagError));
+    }
+    findAlternativeDeclarationFile(filename) {
+        if (!filename.endsWith('.d.ts')) {
+            return null;
+        }
+        const baseName = filename.slice(0, -5); // Remove '.d.ts'
+        const possibleSourceExtensions = [
+            ...this.glintConfig.environment.typedScriptExtensions,
+            ...this.glintConfig.environment.untypedScriptExtensions,
+        ];
+        for (const sourceExt of possibleSourceExtensions) {
+            if (sourceExt !== '.ts' && sourceExt !== '.js') {
+                // Check if there's a source file with this extension
+                const sourceFile = baseName + sourceExt;
+                if (this.documents.documentExists(sourceFile)) {
+                    // Check for both .ext.d.ts and .d.ext.ts patterns
+                    // Pattern 1: component.gjs.d.ts (standard TypeScript pattern)
+                    const standardDtsFile = sourceFile + '.d.ts';
+                    if (this.ts.sys.fileExists(standardDtsFile)) {
+                        return standardDtsFile;
+                    }
+                    // Pattern 2: component.d.gjs.ts (allowArbitraryExtensions pattern)
+                    // Only check this pattern if allowArbitraryExtensions is enabled
+                    const compilerOptions = this.glintConfig.getCompilerOptions();
+                    // @ts-ignore: allowArbitraryExtensions may not be available in older TypeScript versions
+                    if (compilerOptions.allowArbitraryExtensions === true) {
+                        const arbitraryDtsFile = baseName + '.d' + sourceExt + '.ts';
+                        if (this.ts.sys.fileExists(arbitraryDtsFile)) {
+                            return arbitraryDtsFile;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+}
+function statSync(path) {
+    try {
+        return fsStatSync(path);
+    }
+    catch (e) {
+        if (e instanceof Error && e.code === 'ENOENT') {
+            return undefined;
+        }
+        throw e;
+    }
+}
+//# sourceMappingURL=transform-manager.js.map

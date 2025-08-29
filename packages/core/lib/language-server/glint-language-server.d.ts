@@ -1,0 +1,60 @@
+import { GlintConfig } from '../config/index.js';
+import TransformManager from '../common/transform-manager.js';
+import type * as ts from 'typescript';
+import { Hover, Location, CompletionItem, Diagnostic, WorkspaceEdit, Range, SymbolInformation, CodeAction, TextEdit } from 'vscode-languageserver';
+import DocumentCache from '../common/document-cache.js';
+import { Position } from './util/position.js';
+import { GetIRResult } from './messages.cjs';
+export interface GlintCompletionItem extends CompletionItem {
+    data: {
+        uri: string;
+        transformedFileName: string;
+        transformedOffset: number;
+        source: string | undefined;
+        tsData: ts.CompletionEntryData | undefined;
+    };
+}
+export default class GlintLanguageServer {
+    private glintConfig;
+    private documents;
+    private transformManager;
+    readonly service: ts.LanguageService;
+    private openFileNames;
+    private rootFileNames;
+    private ts;
+    constructor(glintConfig: GlintConfig, documents: DocumentCache, transformManager: TransformManager);
+    dispose(): void;
+    openFile(uri: string, contents: string): void;
+    updateFile(uri: string, contents: string): void;
+    closeFile(uri: string): void;
+    watchedFileWasAdded(uri: string): void;
+    watchedFileDidChange(uri: string): void;
+    watchedFileWasRemoved(uri: string): void;
+    getDiagnostics(uri: string): Array<Diagnostic>;
+    findSymbols(query: string): Array<SymbolInformation>;
+    getCompletions(uri: string, position: Position, formatting?: ts.FormatCodeSettings, preferences?: ts.UserPreferences): GlintCompletionItem[] | undefined;
+    getCompletionDetails(item: GlintCompletionItem, formatting?: ts.FormatCodeSettings, preferences?: ts.UserPreferences): GlintCompletionItem;
+    private convertCodeActionToTextEdit;
+    prepareRename(uri: string, position: Position): Range | undefined;
+    getEditsForRename(uri: string, position: Position, newText: string): WorkspaceEdit;
+    getHover(uri: string, position: Position): Hover | undefined;
+    getDefinition(uri: string, position: Position): Location[];
+    getReferences(uri: string, position: Position): Location[];
+    getOriginalContents(uri: string): string | undefined;
+    getTransformedContents(uri: string): GetIRResult | undefined;
+    getCodeActions(uri: string, actionKind: string, range: Range, diagnosticCodes: Diagnostic[], formatOptions?: ts.FormatCodeSettings, preferences?: ts.UserPreferences): CodeAction[];
+    organizeImports(uri: string, formatOptions?: ts.FormatCodeSettings, preferences?: ts.UserPreferences): TextEdit[];
+    private applyCodeAction;
+    private filterDiagnosticCodes;
+    private transformCodeFixActionToCodeAction;
+    private insertGlintIgnore;
+    private isFixForTS;
+    private getTransformedOffsetsFromPositions;
+    private calculateOriginalLocations;
+    private textSpanToLocation;
+    private findDiagnosticsSource;
+    private getTransformedOffset;
+    private isAnalyzableFile;
+    private allKnownFileNames;
+    private parseTsconfig;
+}

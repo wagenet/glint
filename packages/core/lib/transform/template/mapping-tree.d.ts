@@ -1,0 +1,73 @@
+import { AST } from '@glimmer/syntax';
+import { Range } from './transformed-module.js';
+import { Identifier } from './map-template-contents.js';
+export declare type MappingSource = AST.Node | TemplateEmbedding | TextContent | Identifier | ParseError;
+/**
+ * In cases where we're unable to parse a template, we still want to
+ * be able to hold a placeholder mapping so that we can respond sensibly
+ * to offset transformation queries. This class acts as a standin for
+ * the proper AST node we were unable to obtain in such cases.
+ */
+export declare class ParseError {
+    readonly type = "ParseError";
+}
+/**
+ * The Glimmer AST uses `TextNode` for both string arg values on elements
+ * and for top-level text content floating in the DOM itself. Since we
+ * want to treat the two differently (namely, string args may have useful
+ * completion suggestions but plain text doesn't), we use a stand-in
+ * node for the latter.
+ */
+export declare class TextContent {
+    readonly type = "TextContent";
+}
+/**
+ * This node represents the root of an embedded template, including any
+ * boilerplate like tagged template syntax or `<template>` that designates
+ * the surrounded contents as a template.
+ */
+export declare class TemplateEmbedding {
+    readonly type = "TemplateEmbedding";
+}
+/**
+ * A `MappingTree` maintains a hierarchy of mappings between ranges of
+ * locations in original and transformed source strings. These mappings
+ * are naturally hierarchical due to the tree structure of the underlying
+ * code.
+ *
+ * For instance, given an expression like `{{foo.bar}}` in a template, a
+ * corresponding expression in TypeScript might be `foo?.bar`. The individual
+ * identifiers `foo` and `bar` map directly to one another, but the full
+ * expressions do as well. By maintaining a full hierarchy of these mappings,
+ * we can always report diagnostics in the template at roughly the same
+ * level of granularity as TS itself uses when reporting on the transformed
+ * output.
+ */
+export default class MappingTree {
+    transformedRange: Range;
+    originalRange: Range;
+    children: Array<MappingTree>;
+    sourceNode: MappingSource;
+    parent: MappingTree | null;
+    constructor(transformedRange: Range, originalRange: Range, children: Array<MappingTree>, sourceNode: MappingSource);
+    /**
+     * Returns the mapping corresponding to the smallest span in the transformed source
+     * that contains the given range, or `null` if that range doesn't fall within
+     * this mapping tree.
+     */
+    narrowestMappingForTransformedRange(range: Range): MappingTree | null;
+    /**
+     * Returns the mapping corresponding to the smallest span in the original source
+     * that contains the given range, or `null` if that range doesn't fall within
+     * this mapping tree.
+     */
+    narrowestMappingForOriginalRange(range: Range): MappingTree | null;
+    toDebugString(options: {
+        originalStart: number;
+        originalSource: string;
+        transformedStart: number;
+        transformedSource: string;
+        indent?: string;
+    }): string;
+    private getSourceRange;
+}
